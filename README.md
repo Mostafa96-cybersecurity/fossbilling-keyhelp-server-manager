@@ -1,6 +1,5 @@
 # fossbilling-keyhelp-server-manager
 KeyHelp server manager module for FOSSBilling with API provisioning, caching and retry logic.
-# FOSSBilling KeyHelp Server Manager
 
 KeyHelp provisioning module for FOSSBilling.
 

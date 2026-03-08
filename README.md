@@ -1,8 +1,15 @@
-# fossbilling-keyhelp-server-manager
-KeyHelp server manager module for FOSSBilling with API provisioning, caching and retry logic.
+# FOSSBilling KeyHelp Server Manager
 
-KeyHelp provisioning module for FOSSBilling.
+KeyHelp server manager module for FOSSBilling.
 
+This module integrates the KeyHelp hosting control panel with FOSSBilling and allows automatic account provisioning, suspension, and package management.
+
+## Keywords
+
+FOSSBilling KeyHelp module  
+KeyHelp server manager  
+FOSSBilling hosting automation  
+KeyHelp API integration
 ## Features
 
 - Automatic account creation

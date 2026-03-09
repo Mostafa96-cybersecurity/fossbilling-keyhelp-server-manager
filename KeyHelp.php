@@ -7,7 +7,7 @@ declare(strict_types=1);
 |
 | Author: Mostafa Mohamed
 | GitHub: https://github.com/Mostafa96-cybersecurity
-| Description:
+| Description: KeyHelp Server Manager module for FOSSBilling. Provides automatic hosting account provisioning, domain management, and API integration with KeyHelp.
 | KeyHelp provisioning module for FOSSBilling.
 | Supports automatic account creation, suspension, package changes,
 | domain synchronization, and API caching.
@@ -18,8 +18,8 @@ declare(strict_types=1);
 class Server_Manager_KeyHelp extends Server_Manager
 {
 
-    const VERSION = "1.0.0";
-    private bool $verifySSL=true;
+    const VERSION = "1.1.0";
+    private bool $verifySSL=false;
     private int $apiRetry=3;
     private int $rateLimitDelay=120000;
 
@@ -108,7 +108,7 @@ class Server_Manager_KeyHelp extends Server_Manager
 
     private function apiRequest(string $method,string $endpoint,?array $data=null)
     {
-
+        $this->clearApiCache();
         $cacheKey=$method.$endpoint;
 
         if($method==="GET" && isset(self::$apiCache[$cacheKey])){
@@ -133,6 +133,7 @@ class Server_Manager_KeyHelp extends Server_Manager
                 CURLOPT_URL=>$url,
                 CURLOPT_RETURNTRANSFER=>true,
                 CURLOPT_CUSTOMREQUEST=>strtoupper($method),
+                CURLOPT_TCP_KEEPALIVE=>1,
 
                 CURLOPT_HTTPHEADER=>[
                     "X-API-Key: ".$this->_config['accesshash'],
@@ -143,7 +144,7 @@ class Server_Manager_KeyHelp extends Server_Manager
                 CURLOPT_SSL_VERIFYPEER=>$this->verifySSL,
                 CURLOPT_SSL_VERIFYHOST=>$this->verifySSL ? 2 : 0,
 
-                CURLOPT_TIMEOUT=>25,
+                CURLOPT_TIMEOUT=>15,
                 CURLOPT_CONNECTTIMEOUT=>8
 
             ]);
@@ -163,7 +164,7 @@ class Server_Manager_KeyHelp extends Server_Manager
             curl_close($ch);
 
             if($response===false || $http>=500){
-                sleep(1);
+                $this->exponentialBackoff($attempts);
                 continue;
             }
 
@@ -172,12 +173,8 @@ class Server_Manager_KeyHelp extends Server_Manager
                 return null;
             }
 
-            $json=json_decode($response);
+            $json=$this->safeJsonDecode($response);
 
-            if(json_last_error()!==JSON_ERROR_NONE){
-                $this->log("JSON ERROR endpoint ".$endpoint." response ".$response);
-                return null;
-            }
 
             if($method==="GET"){
                     self::$apiCache[$cacheKey]=[
@@ -329,65 +326,86 @@ class Server_Manager_KeyHelp extends Server_Manager
 
 
 
-    public function createAccount(Server_Account $account):bool
+    public function createAccount(Server_Account $account): bool
     {
+        $client = $account->getClient();
+        $email  = $client->getEmail();
+        $domain = strtolower($account->getDomain());
 
-        $username=$account->getUsername();
+        $existingUser = $this->findUserByEmail($email);
 
-        if($username){
+        if ($existingUser && !empty($existingUser->id)) {
 
-            $existing=$this->apiRequest("GET","clients/name/".$username);
+            $userId = (int)$existingUser->id;
 
-            if($existing && !empty($existing->id)){
+            $domains = $this->getUserDomains($userId);
+
+            if (in_array($domain, array_map("strtolower", $domains))) {
+                $this->log("Domain already exists ".$domain);
+                $account->setUsername($existingUser->username);
+                $account->setPassword(null);
                 return true;
             }
 
+            $clientInfo = $this->apiRequest("GET","clients/".$userId);
+            $planId = $clientInfo->id_hosting_plan ?? $clientInfo->id_plan ?? null;
+
+            if ($planId) {
+                $plan = $this->apiRequest("GET","hosting-plans/".$planId);
+                if ($plan && isset($plan->max_domains) && $plan->max_domains > 0) {
+                    if ($plan->max_domains > 0 && count($domains) >= $plan->max_domains) {
+                        throw new Server_Exception("Your hosting plan allows only ".$plan->max_domains." domain(s). Please upgrade your plan or contact support.");
+                    }
+                }
+            }
+
+            $this->apiRequest("POST","domains",[
+                "id_user"=>$userId,
+                "domain"=>$domain
+            ]);
+
+            $account->setUsername($existingUser->username);
+            $account->setPassword(null);
+
+            $this->log("Domain added ".$domain." to ".$existingUser->username);
+
+            return true;
         }
 
-        $client=$account->getClient();
+        $username = $this->generateUsername($domain);
+        $password = $this->generatePassword();
 
-        $username=$this->generateUsername($account->getDomain());
-        $password=$this->generatePassword();
+        $plan = $this->apiRequest("GET","hosting-plans/name/".urlencode($account->getPackage()->getName()));
 
-        $plan=$this->apiRequest("GET","hosting-plans/name/".urlencode($account->getPackage()->getName()));
-
-        if(!$plan || empty($plan->id)){
+        if (!$plan || empty($plan->id)) {
             throw new Server_Exception("Hosting plan not found");
         }
 
-        $user=$this->apiRequest("POST","clients",[
-
+        $user = $this->apiRequest("POST","clients",[
             "username"=>$username,
-            "email"=>$client->getEmail(),
+            "email"=>$email,
             "password"=>$password,
             "language"=>"en",
             "id_hosting_plan"=>$plan->id,
             "create_system_domain"=>false
-
         ]);
 
-        if(!$user || empty($user->id)){
+        if (!$user || empty($user->id)) {
             throw new Server_Exception("User creation failed");
         }
 
         $this->apiRequest("POST","domains",[
-
             "id_user"=>$user->id,
-            "domain"=>$account->getDomain()
-
+            "domain"=>$domain
         ]);
 
         $account->setUsername($username);
         $account->setPassword($password);
 
-        $this->log("Account created ".$username." for ".$account->getDomain());
+        $this->log("Account created ".$username." for ".$domain);
 
         return true;
-
     }
-
-
-
     public function changeAccountPackage(Server_Account $account,Server_Package $package):bool
     {
 
@@ -396,6 +414,9 @@ class Server_Manager_KeyHelp extends Server_Manager
         if(!$userId){
             return true;
         }
+
+        $username=$this->generateUsername($account->getDomain());
+        $password=$this->generatePassword();
 
         $plan=$this->apiRequest("GET","hosting-plans/name/".urlencode($package->getName()));
 
@@ -546,23 +567,34 @@ Please open a support ticket if you need assistance with this request.");
 
     public function cancelAccount(Server_Account $account):bool
     {
-
         $userId=$this->getUserId($account->getUsername());
 
         if(!$userId){
             return true;
         }
 
-        $this->apiRequest("DELETE","clients/".$userId);
+        $all=$this->apiRequest("GET","domains");
 
-        $this->log("Account deleted ".$account->getUsername());
+        if(!$all){
+            return true;
+        }
+
+        foreach($all as $d){
+
+            if(strtolower($d->domain) === strtolower($account->getDomain())){
+
+                $this->apiRequest("DELETE","domains/".$d->id);
+
+                $this->log("Domain deleted ".$d->domain);
+
+                return true;
+
+            }
+
+        }
 
         return true;
-
     }
-
-
-
     public function changeAccountIp(Server_Account $account,string $newIp)
     {
         return false;
@@ -616,6 +648,96 @@ Please open a support ticket if you need assistance with this request.");
         }
 
         return $account;
+
+    }
+
+
+    /* ============================
+       Improvements Patch v1.1
+       ============================ */
+
+    private function findUserByEmail(string $email): ?object
+    {
+        $email=strtolower(trim($email));
+        $users=$this->apiRequest("GET","clients");
+        
+
+        if(!$users || !is_array($users)){
+            return null;
+        }
+
+        foreach($users as $u){
+            if(empty($u->email)){
+               continue;
+            }
+            
+            if(strtolower($u->email)===$email){
+                return $u;
+            }
+        }
+
+        return null;
+    }
+
+
+    private function strongPassword(): string
+    {
+        $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()';
+        $password = '';
+
+        for($i=0;$i<18;$i++){
+            $password .= $chars[random_int(0, strlen($chars)-1)];
+        }
+
+        return $password;
+    }
+
+
+
+    private function exponentialBackoff(int $attempt): void
+    {
+        $delay = pow(2,$attempt);
+        sleep($delay);
+    }
+
+
+
+    private function clearApiCache(): void
+    {
+        if(count(self::$apiCache) > 200){
+            self::$apiCache=[];
+            $this->log("API cache cleared automatically");
+        }
+    }
+
+
+
+    private function safeJsonDecode(string $response)
+    {
+        try {
+            return json_decode($response, false, 512, JSON_THROW_ON_ERROR);
+        } catch(\JsonException $e){
+            $this->log("JSON decode failed: ".$e->getMessage());
+            throw new Server_Exception("Invalid JSON returned from KeyHelp API");
+        }
+    }
+
+
+
+    private function enforcePlanDomainLimit(int $userId, int $planId): void
+    {
+
+        $plan = $this->apiRequest("GET","hosting-plans/".$planId);
+
+        if(!$plan || !isset($plan->max_domains)){
+            return;
+        }
+
+        $domains = $this->getUserDomains($userId);
+
+        if($plan->max_domains > 0 && count($domains) >= $plan->max_domains){
+            throw new Server_Exception("Domain limit reached for this hosting plan.");
+        }
 
     }
 

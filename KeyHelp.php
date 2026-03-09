@@ -19,7 +19,7 @@ class Server_Manager_KeyHelp extends Server_Manager
 {
 
     const VERSION = "1.1.0";
-    private bool $verifySSL=false;
+    private bool $verifySSL=true;
     private int $apiRetry=3;
     private int $rateLimitDelay=120000;
 
